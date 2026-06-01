@@ -188,13 +188,6 @@ def price_to_tick(token0_per_token1: float, token0_decimals: int, token1_decimal
     return int(math.log(price_raw) / math.log(1.0001))
 
 
-# Common intermediary tokens for multi-hop routing (mainnet addresses)
-_DEFAULT_INTERMEDIARIES = [
-    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # WETH
-    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
-]
-
-
 def find_best_route(
     pool_states: dict[str, dict[str, Any]],
     token_in: str,
@@ -213,15 +206,18 @@ def find_best_route(
         token_in: Input token address.
         token_out: Output token address.
         amount_in: Input amount in smallest unit.
-        intermediaries: Addresses to try as intermediate hops.
-            Defaults to WETH and USDC on mainnet.
+        intermediaries: Addresses to try as intermediate hops. These MUST be
+            chain-appropriate (e.g. the chain's WETH/USDC) — the caller is
+            responsible for resolving them per chain. When omitted, only
+            direct pools are considered (no multi-hop). A mainnet default here
+            would silently break multi-hop on every other chain.
 
     Returns:
         (output_amount, route_description, hops) or None.
         Each hop is a dict with pool_addr, pool_state, fee, zero_for_one.
     """
     if intermediaries is None:
-        intermediaries = _DEFAULT_INTERMEDIARIES
+        intermediaries = []
 
     token_in_lower = token_in.lower()
     token_out_lower = token_out.lower()

@@ -551,6 +551,16 @@ class BaselineSwapSolver(IntentSolver):
         if pool_states:
             self._pool_cache[chain_id] = pool_states
             self._pool_cache_time[chain_id] = now
+            # This seed was just rebuilt from _KNOWN_POOLS only, dropping any
+            # pools that prior factory discovery had merged into the cache.
+            # Invalidate this chain's pair-discovery markers so the next
+            # routing call re-discovers those pairs (with fresh state) instead
+            # of being short-circuited by a now-stale "already discovered"
+            # marker — otherwise factory-discovered (incl. multi-hop) pools
+            # silently vanish until the pair TTL lapses.
+            stale = [k for k in self._pair_discovery_cache if k[0] == chain_id]
+            for k in stale:
+                del self._pair_discovery_cache[k]
             logger.debug(
                 "Discovered %d pools on chain %d via RPC",
                 len(pool_states), chain_id,
@@ -634,6 +644,28 @@ class BaselineSwapSolver(IntentSolver):
                          discovered, token_a[:10], token_b[:10], chain_id)
         return pool_states
 
+    def _intermediaries_for_chain(self, chain_id: int) -> list[str]:
+        """Chain-appropriate multi-hop intermediary tokens (WETH + USDC).
+
+        Sourced from the trusted SDK token registry so the addresses are
+        always correct for the chain. A hardcoded mainnet list silently
+        disables multi-hop on every other chain — the intermediary pools
+        never resolve on the factory, so two-hop discovery and routing both
+        come up empty (this was the Base/BT EVM multi-hop dead-spot).
+        """
+        from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN, TOKENS
+
+        # Local Anvil forks mainnet, so reuse mainnet token addresses there.
+        token_chain = 1 if chain_id == 31337 else chain_id
+        mids: list[str] = []
+        wnt = WRAPPED_NATIVE_TOKEN.get(chain_id)
+        if wnt:
+            mids.append(wnt)
+        usdc = TOKENS.get(token_chain, {}).get("USDC")
+        if usdc and usdc.lower() not in {m.lower() for m in mids}:
+            mids.append(usdc)
+        return mids
+
     def _ensure_pools_for_route(
         self,
         chain_id: int,
@@ -652,11 +684,11 @@ class BaselineSwapSolver(IntentSolver):
         # Direct pair
         self._discover_pools_for_pair(chain_id, token_in, token_out, pool_states)
 
-        # Intermediary pairs for multi-hop
-        from strategies.dex_aggregator.pool_math import _DEFAULT_INTERMEDIARIES
+        # Intermediary pairs for multi-hop (chain-appropriate WETH/USDC)
+        intermediaries = self._intermediaries_for_chain(chain_id)
 
         in_lower, out_lower = token_in.lower(), token_out.lower()
-        for mid in _DEFAULT_INTERMEDIARIES:
+        for mid in intermediaries:
             mid_lower = mid.lower()
             if mid_lower == in_lower or mid_lower == out_lower:
                 continue
@@ -676,7 +708,7 @@ class BaselineSwapSolver(IntentSolver):
                     self._query_pool_state, self._pair_discovery_cache,
                     cache_ttl=self._pool_cache_ttl,
                 )
-                for mid in _DEFAULT_INTERMEDIARIES:
+                for mid in intermediaries:
                     mid_lower = mid.lower()
                     if mid_lower == in_lower or mid_lower == out_lower:
                         continue
@@ -693,14 +725,21 @@ class BaselineSwapSolver(IntentSolver):
 
         return pool_states
 
-    def _derive_prices(self, pool_states: dict[str, dict[str, Any]]) -> dict[str, float]:
+    def _derive_prices(
+        self, pool_states: dict[str, dict[str, Any]], chain_id: int = 1,
+    ) -> dict[str, float]:
         """Derive USD prices from pool sqrtPriceX96 values.
 
         Uses USDC-paired pools to extract USD prices. Simplified
         price derivation — production solvers would use multiple sources.
         """
+        from minotaur_subnet.blockchain.tokens import TOKENS
+
         prices: dict[str, float] = {"USDC/USD": 1.0, "USDT/USD": 1.0, "DAI/USD": 1.0}
-        usdc_lower = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        token_chain = 1 if chain_id == 31337 else chain_id
+        usdc_lower = TOKENS.get(token_chain, {}).get(
+            "USDC", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        ).lower()
 
         for _pool_addr, state in pool_states.items():
             token0 = state.get("token0", "").lower()
@@ -804,7 +843,7 @@ class BaselineSwapSolver(IntentSolver):
                 pool_states = dict(pool_states)
             self._ensure_pools_for_route(chain_id, pool_states, input_token, output_token)
 
-        prices = self._derive_prices(pool_states) if pool_states else {}
+        prices = self._derive_prices(pool_states, chain_id) if pool_states else {}
 
         context = ProcessorContext(
             chain_id=chain_id,
@@ -821,7 +860,7 @@ class BaselineSwapSolver(IntentSolver):
 
             if amount_in > 0:
                 route = self._find_best_executable_route(
-                    pool_states, input_token, output_token, amount_in,
+                    pool_states, input_token, output_token, amount_in, chain_id,
                 )
                 if route is not None:
                     output_amount, route_desc, hops = route
@@ -1297,6 +1336,7 @@ class BaselineSwapSolver(IntentSolver):
         token_in: str,
         token_out: str,
         amount_in: int,
+        chain_id: int,
     ) -> tuple[int, str, list[dict[str, Any]]] | None:
         """Find the best route across all DEXes, but only return one we
         can actually execute as a single transaction.
@@ -1313,7 +1353,11 @@ class BaselineSwapSolver(IntentSolver):
         """
         from strategies.dex_aggregator.pool_math import find_best_route
 
-        unrestricted = find_best_route(pool_states, token_in, token_out, amount_in)
+        intermediaries = self._intermediaries_for_chain(chain_id)
+        unrestricted = find_best_route(
+            pool_states, token_in, token_out, amount_in,
+            intermediaries=intermediaries,
+        )
         if unrestricted is None:
             return None
 
@@ -1335,7 +1379,10 @@ class BaselineSwapSolver(IntentSolver):
         for subset in (v3_only, aero_only):
             if not subset:
                 continue
-            r = find_best_route(subset, token_in, token_out, amount_in)
+            r = find_best_route(
+                subset, token_in, token_out, amount_in,
+                intermediaries=intermediaries,
+            )
             if r is not None:
                 candidates.append(r)
 
@@ -1703,7 +1750,7 @@ class BaselineSwapSolver(IntentSolver):
                     pool_states = dict(pool_states)
                 self._ensure_pools_for_route(src_chain, pool_states, input_token, output_token)
 
-            prices = self._derive_prices(pool_states) if pool_states else {}
+            prices = self._derive_prices(pool_states, src_chain) if pool_states else {}
             context = ProcessorContext(
                 chain_id=src_chain, timestamp=int(time.time()),
                 block_number=0, rpc_url=self._rpc_urls.get(src_chain, ""),
@@ -1735,19 +1782,12 @@ class BaselineSwapSolver(IntentSolver):
             if not pool_states:
                 return []
 
-            # Build swap interactions using the processor
-            from strategies.dex_aggregator.pool_math import find_best_route
-            # Find a route from any bridgeable token to the output
-            for seed in seeds:
-                if seed.lower() == output_token.lower():
-                    continue
-                route = find_best_route(pool_states, seed, output_token, 1)
-                if route:
-                    # Build actual swap calldata for this route
-                    _, _, hops = route
-                    return self._build_swap_interactions(
-                        dst_chain, seed, output_token, hops, recipient,
-                    )
+            # Cross-chain destination-leg swap construction is not supported
+            # in this single-chain build. The earlier implementation here
+            # called a `_build_swap_interactions` helper that does not exist;
+            # the broken reference was silently swallowed by the surrounding
+            # `except`. Return no interactions explicitly until cross-chain
+            # is reintroduced with a real builder.
             return []
         except Exception as exc:
             logger.warning("Cross-chain dest swap interactions failed: %s", exc)
@@ -1880,7 +1920,7 @@ class BaselineSwapSolver(IntentSolver):
         # a cross-DEX 2-hop the planner refuses to emit (the planner falls
         # back to single-DEX, leaving a quote/plan output mismatch).
         result = self._find_best_executable_route(
-            pool_states, input_token, output_token, amount_in,
+            pool_states, input_token, output_token, amount_in, chain_id,
         )
         if result is None:
             raise ValueError(
