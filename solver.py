@@ -1,4 +1,15 @@
-"""Minotaur SN112 DEX-aggregator solver — score-aware multi-venue router.
+"""Minotaur SN112 DEX-aggregator solver — king-iris MAX-OUTPUT multi-venue router (v20).
+
+v20 change: the subnet is shipping RELATIVE per-order scoring (#394-#399) that
+compares challenger vs champion on RAW DELIVERED OUTPUT (gas term / quote anchor /
+clamp all removed), adopting iff no order regresses and >=1 strictly wins. The
+incumbent (score-aware-router) DOWN-ROUTES output for gas under the old absolute
+scorer — every such trade is a REGRESSION under the relative rule. v20 sets the
+venue-selection gas weight to 0 (``SOLVER_GAS_WEIGHT``), so it picks the MAX-OUTPUT
+single-hop on every order: it never regresses and strictly out-delivers a
+gas-sacrificing champion on every down-routed order -> a clean relative dethrone,
+while keeping the exact-quote multi-venue coverage + robustness below. The original
+score-aware design notes follow.
 
 Design (validated on the fork-scoring oracle, run_oracle_delta.py)
 ------------------------------------------------------------------
@@ -55,9 +66,22 @@ from minotaur_subnet.shared.types import ExecutionPlan, Interaction
 
 logger = logging.getLogger(__name__)
 
-SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "score-aware-router")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "1.3.0")
-SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "miner")
+SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-minotaur-solver")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "21.0.0")
+SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king")
+
+# v20: weight of the gas term in single-hop venue selection. The incumbent
+# score-aware build used 0.2 (the live 0.8*output + 0.2*gas absolute scorer),
+# which DOWN-ROUTES to a leaner-gas venue even when another venue delivers MORE
+# output. The subnet is shipping RELATIVE per-order scoring (#394-#399), which
+# compares challenger vs champion on RAW DELIVERED OUTPUT (gas term, quote anchor
+# and clamp all removed) and adopts iff NO order regresses and >=1 strictly wins.
+# Against that rule, any gas-for-output trade is a REGRESSION. v20 sets the gas
+# weight to 0 -> pure MAX OUTPUT on every order: it never regresses and strictly
+# out-delivers a gas-sacrificing champion on every down-routed order -> a clean
+# relative dethrone. (Set SOLVER_GAS_WEIGHT=0.2 to restore the absolute-regime
+# gas-aware behaviour.) Output coverage + robustness layers are unchanged.
+_GAS_WEIGHT = float(os.environ.get("SOLVER_GAS_WEIGHT", "0.0"))
 
 # Base (chain 8453) only — the whole live order book is Base.
 _BASE = 8453
@@ -244,6 +268,27 @@ class MinerSolver(BaselineSwapSolver):
             logger.exception("[solver] metadata slim skipped; leaving plan metadata as-is")
         return plan
 
+    @staticmethod
+    def _is_multihop_plan(plan):
+        """True if the plan ships a multi-hop exactInput — the route family that
+        reverts CallFailed(index=1) on the cbBTC->WETH phantom 2-hop and drops the
+        order. Detected by the route metadata (set pre-slim) and, as a backstop,
+        the swap selector (0xb858183f / 0xc04b8d59 = exactInput; single-hop
+        exactInputSingle is 0x04e45aaf / 0x414bf389 / 0xa026383e)."""
+        if plan is None:
+            return False
+        try:
+            m = plan.metadata or {}
+            route = str(m.get("route") or "").lower()
+            if ("multi" in route) or ("hop" in route) or int(m.get("hops", 1) or 1) > 1:
+                return True
+            for ix in (getattr(plan, "interactions", None) or []):
+                if (ix.call_data or "")[:10].lower() in ("0xb858183f", "0xc04b8d59"):
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _generate_plan_impl(self, intent, state, snapshot=None):
         def _baseline():
             return BaselineSwapSolver.generate_plan(self, intent, state, snapshot)
@@ -260,6 +305,20 @@ class MinerSolver(BaselineSwapSolver):
             self._score_aware_singlehop, (intent, state, snapshot, base_plan),
             timeout=_SELECT_BUDGET_S)
         plan = enhanced if enhanced is not None else base_plan
+
+        # Robustness net for the select-timeout path: never DEFAULT to an
+        # unvalidated multi-hop. When selection timed out (enhanced is None) and
+        # the baseline handed us a multi-hop — the cbBTC->WETH phantom "0.00% +
+        # 0.01%" 2-hop that reverts CallFailed(index=1) and DROPS the order — make
+        # one more bounded attempt at a real single-hop fill (base_plan=None makes
+        # _score_aware_singlehop build the max-output single-hop directly). The
+        # gas-tilted champion serves this order via single-hop; so can we.
+        if enhanced is None and self._is_multihop_plan(plan):
+            sh = self._bounded_call(
+                self._score_aware_singlehop, (intent, state, snapshot, None),
+                timeout=_SELECT_BUDGET_S)
+            if sh is not None and not self._is_multihop_plan(sh):
+                plan = sh
 
         plan = self._fix_multihop_v2(plan)
         if plan is None:
@@ -442,7 +501,8 @@ class MinerSolver(BaselineSwapSolver):
             ref = max(best_out, bp_out, 1)
 
             def score(out, gas_model):
-                return 0.4 * (out / ref) - 0.2 * (gas_model / 1e6)
+                # v20: gas weight defaults to 0 -> pure MAX OUTPUT (relative regime).
+                return 0.4 * (out / ref) - _GAS_WEIGHT * (gas_model / 1e6)
 
             # Only consider single-hops that clear the order min — a single-hop
             # below min would revert (e.g. the THIN direct WETH/DAI pool delivers
@@ -455,16 +515,28 @@ class MinerSolver(BaselineSwapSolver):
             # Primary key: score proxy; tie-break: lower quoter gasEstimate.
             best = max(usable, key=lambda c: (round(score(c["out"], c["gas_model"]), 9), -c["gas_est"]))
 
-            # Don't regress a baseline route that scores higher (e.g. a 2-hop
-            # that genuinely out-delivers every single-hop venue).
+            # Don't regress a baseline route that scores higher — BUT only honor a
+            # SINGLE-HOP baseline here. A multi-hop baseline's expected_output is
+            # route-math that is frequently a PHANTOM-pool fantasy: e.g. cbBTC->WETH
+            # picks a "0.00% + 0.01%" 2-hop quoting 0.527 WETH that reverts
+            # CallFailed(index=1) on execution -> delivers 0 -> a DROPPED order the
+            # gas-tilted champion fills via a real single-hop (0.3806 WETH). We only
+            # reach this line when a usable single-hop CLEARS the order min (the
+            # `usable` gate above already ships the baseline when NO single-hop
+            # fills — the legit thin-pool multi-hop case), so a real single-hop fill
+            # is always in hand. Never trade it for an unvalidated multi-hop's
+            # modeled output: under max-output (gas weight 0) the fantasy always
+            # "wins" the score proxy and silently drops the order.
             if base_plan is not None and bp_out > 0 and (min_out <= 0 or bp_out >= min_out):
                 m = (base_plan.metadata or {})
                 route = str(m.get("route") or "").lower()
-                bp_gas = (_GAS_MULTIHOP if ("multi" in route or "hop" in route)
-                          else (_OFFSET_AERO + 110000 if "aero" in route
-                                else _OFFSET_UNI + 100000))
-                if score(bp_out, bp_gas) >= score(best["out"], best["gas_model"]):
-                    return base_plan
+                is_multihop = (("multi" in route) or ("hop" in route)
+                               or int(m.get("hops", 1) or 1) > 1)
+                if not is_multihop:
+                    bp_gas = (_OFFSET_AERO + 110000 if "aero" in route
+                              else _OFFSET_UNI + 100000)
+                    if score(bp_out, bp_gas) >= score(best["out"], best["gas_model"]):
+                        return base_plan
 
             return self._build_singlehop_plan(
                 intent, state, snapshot, best, tin, tout, amount_in, chain_id)
