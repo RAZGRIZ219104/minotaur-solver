@@ -402,7 +402,7 @@ class ChallengerSolver(_McSolver):
         rep = getattr(base, "_replace", None)
         if callable(rep):
             try:
-                return rep(name="challenger-fill-2")
+                return rep(name="pymsno-v1")
             except Exception:
                 pass
         return base
@@ -432,7 +432,7 @@ class ChallengerSolver(_McSolver):
             recipient = self._apex_recipient(state, p)
             deadline = int(self._apex_deadline(snapshot))
             ix = self._mc_ix(tin, tout, amt, mino, best_fee, recipient, deadline, cid)
-            plan = ExecutionPlan(intent_id=intent.app_id, interactions=ix, deadline=deadline, nonce=state.nonce, metadata={"solver": "challenger-fill", "chain_id": cid})
+            plan = ExecutionPlan(intent_id=intent.app_id, interactions=ix, deadline=deadline, nonce=state.nonce, metadata={"solver": "pymsno-v1", "chain_id": cid})
             return None if self._v_is_empty(plan) else plan
         except Exception:
             logger.exception("[challenger] live fill failed")
