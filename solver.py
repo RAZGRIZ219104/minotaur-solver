@@ -332,7 +332,10 @@ class RobustFloorSolver(_ChampFloor):
             bn = None
         return bn if bn and bn > 0 else "latest"
 
-    def _eth_superset_plan(self, intent, state, snapshot, champ):
+    def _eth_swap_params(self, intent, state):
+        """Extract + guard the (tin, tout, amt, min_out, recip) tuple for a
+        valid single-chain-1 ERC20 swap; None defers to the champion.
+        (Split from _eth_superset_plan — logic unchanged.)"""
         p = self._normalized_swap_params(intent, state)
         tin = str(p.get("input_token", "") or "").lower()
         tout = str(p.get("output_token", "") or "").lower()
@@ -357,16 +360,11 @@ class RobustFloorSolver(_ChampFloor):
         )
         if not _is_addr(recip):
             return None
+        return tin, tout, amt, min_out, recip
 
-        w3 = self._eth_w3()
-        if w3 is None:
-            return None  # zero-RPC => behave exactly like the champion
-
-        block = self._eth_read_block(snapshot)
-        champ_empty = champ is None or not getattr(champ, "interactions", None)
-        champ_route = _champ_route(tin, tout)
-
-        # Budget-capped, individually try/excepted quote closure.
+    def _eth_quote_fn(self, w3, block, amt):
+        """Budget-capped, individually try/excepted quote closure.
+        (Split from _eth_superset_plan — logic unchanged.)"""
         seen = {}
         n = [0]
 
@@ -390,6 +388,14 @@ class RobustFloorSolver(_ChampFloor):
             seen[key] = q
             return q
 
+        return quote_fn
+
+    def _eth_route_plan(self, intent, state, params, champ, quote_fn, block):
+        """Decide the winning route and build the plan; None defers to the
+        champion. (Split from _eth_superset_plan — logic unchanged.)"""
+        tin, tout, amt, min_out, recip = params
+        champ_empty = champ is None or not getattr(champ, "interactions", None)
+        champ_route = _champ_route(tin, tout)
         route = _decide(
             tin, tout, amt, min_out, champ_route, champ_empty,
             quote_fn, self._STRICT_MARGIN_BPS,
@@ -412,5 +418,32 @@ class RobustFloorSolver(_ChampFloor):
             metadata={"solver": _route_tag(route), "chain_id": 1, "route": repr(route)},
         )
 
+    def _eth_superset_plan(self, intent, state, snapshot, champ):
+        params = self._eth_swap_params(intent, state)
+        if params is None:
+            return None
+        w3 = self._eth_w3()
+        if w3 is None:
+            return None  # zero-RPC => behave exactly like the champion
+        block = self._eth_read_block(snapshot)
+        quote_fn = self._eth_quote_fn(w3, block, params[2])
+        return self._eth_route_plan(intent, state, params, champ, quote_fn, block)
 
-SOLVER_CLASS = RobustFloorSolver
+
+class PymsnoSolver(RobustFloorSolver):
+    """pymsno-v1: the certified champion, re-factored — every routing, quoting
+    and plan path is inherited unchanged (name-only wrapper; the factorization
+    work lives in the _eth_superset_plan split above)."""
+
+    def metadata(self):
+        base = super().metadata()
+        try:
+            import dataclasses as _dc
+            if _dc.is_dataclass(base):
+                return _dc.replace(base, name="pymsno-v1")
+        except Exception:
+            pass
+        return base
+
+
+SOLVER_CLASS = PymsnoSolver
