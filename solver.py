@@ -431,4 +431,60 @@ class _McSolver(_PuttyCleanSolver):
         if lift is not None:
             return lift
         return base
-SOLVER_CLASS = _McSolver
+class ChallengerSolver(_McSolver):
+    """Never-regress blind-spot filler on the certified champion stack.
+    Serves a live uni-v3 single-hop ONLY when the champion returns empty;
+    defers to the champion plan on any doubt (can lift a 0, never regress)."""
+
+    def metadata(self):
+        base = super().metadata()
+        rep = getattr(base, "_replace", None)
+        if callable(rep):
+            try:
+                return rep(name="pymsno-v1")
+            except Exception:
+                pass
+        return base
+
+    def _cf_live_fill(self, intent, state, snapshot):
+        try:
+            p = self._normalized_swap_params(intent, state) or {}
+            tin = str(p.get("input_token", "") or "")
+            tout = str(p.get("output_token", "") or "")
+            amt = int(p.get("input_amount", 0) or 0)
+            mino = int(p.get("min_output_amount", 0) or 0)
+            if amt <= 0 or not tin or not tout or tin.lower() == tout.lower():
+                return None
+            cid = int(getattr(state, "chain_id", 0) or 0)
+            w3 = self._get_web3(cid or 8453)
+            if w3 is None:
+                return None
+            calls = [(_MC_QUOTER, self._mc_qdata(tin, tout, amt, fee)) for fee in _MC_FEES]
+            res = self._mc_run(w3, calls)
+            if res is None:
+                return None
+            best, best_fee = self._mc_best(res)
+            if best_fee is None or best <= 0 or best < mino:
+                return None
+            recipient = self._apex_recipient(state, p)
+            deadline = int(self._apex_deadline(snapshot))
+            ix = self._mc_ix(tin, tout, amt, mino, best_fee, recipient, deadline, cid)
+            plan = ExecutionPlan(intent_id=intent.app_id, interactions=ix, deadline=deadline, nonce=state.nonce, metadata={"solver": "pymsno-v1", "chain_id": cid})
+            return None if self._v_is_empty(plan) else plan
+        except Exception:
+            logger.exception("[challenger] live fill failed")
+            return None
+
+    def generate_plan(self, intent, state, snapshot=None):
+        base = super().generate_plan(intent, state, snapshot)
+        if not self._v_is_empty(base):
+            return base
+        try:
+            fill = self._cf_live_fill(intent, state, snapshot)
+            if fill is not None:
+                return fill
+        except Exception:
+            logger.exception("[challenger] generate_plan fill failed")
+        return base
+
+SOLVER_CLASS = ChallengerSolver
