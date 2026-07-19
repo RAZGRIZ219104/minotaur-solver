@@ -1469,7 +1469,7 @@ class BaselineSwapSolver(_BaselineSwapSolver_fz):
                         direct = find_best_pool(pool_states, token_in, token_out, amount_in)
                         if direct is not None:
                             addr, state, output = direct
-                            return (output, f'direct via {(state.get('fee') or 0) / 1000000:.2%} pool', [{'pool_addr': addr, 'pool_state': state, 'fee': int(state.get('fee', 3000))}])
+                            return (output, f'direct via {(state.get("fee") or 0) / 1000000:.2%} pool', [{'pool_addr': addr, 'pool_state': state, 'fee': int(state.get('fee', 3000))}])
                         return None
                         return _DR_UNSET
                         return _DR_UNSET
