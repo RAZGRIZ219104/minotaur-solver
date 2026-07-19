@@ -377,4 +377,79 @@ class _McSolver(_PuttyCleanSolver):
         if ap is not None:
             return ap
         return base
-SOLVER_CLASS = _McSolver
+class ChallengerSolver(_McSolver):
+    """Never-regress blind-spot filler on top of the full certified champion stack.
+
+    Changes exactly ONE thing vs the champion: when the ENTIRE champion stack
+    returns an EMPTY plan for a swap (delivers 0 — a blind spot), try a live
+    Uniswap-V3 single-hop across the champion's own quoter fee tiers and serve
+    the best route that clears the order's min_out.
+
+    Why this cannot regress or be vetoed (the v133-v137 doctrine, applied):
+      * Fires ONLY when the champion plan is empty (0 interactions). Lifting a
+        champion-0 to a real delivery is a ``blind_spot_cover`` = a win; it can
+        never turn a champion-served order into a worse/dropped one.
+      * On ANY doubt (no params / no web3 / no tier clears min_out / exception)
+        it returns the champion's own plan unchanged.
+      * All quoting/encoding reuses the champion's OWN proven helpers
+        (``_mc_qdata`` / ``_mc_run`` / ``_mc_best`` / ``_mc_ix``) — no new
+        calldata path to get wrong. A live re-quote never goes stale, so unlike
+        a static route table it survives the champion improving.
+    """
+
+    def metadata(self):
+        base = super().metadata()
+        rep = getattr(base, "_replace", None)
+        if callable(rep):
+            try:
+                return rep(name="challenger-fill-2")
+            except Exception:
+                pass
+        return base
+
+    def _cf_live_fill(self, intent, state, snapshot):
+        """Best live uni-v3 single-hop >= min_out for an empty-champion order,
+        or None. Champion helpers only; defers on any doubt."""
+        try:
+            p = self._normalized_swap_params(intent, state) or {}
+            tin = str(p.get("input_token", "") or "")
+            tout = str(p.get("output_token", "") or "")
+            amt = int(p.get("input_amount", 0) or 0)
+            mino = int(p.get("min_output_amount", 0) or 0)
+            if amt <= 0 or not tin or not tout or tin.lower() == tout.lower():
+                return None
+            cid = int(getattr(state, "chain_id", 0) or 0)
+            w3 = self._get_web3(cid or 8453)
+            if w3 is None:
+                return None
+            calls = [(_MC_QUOTER, self._mc_qdata(tin, tout, amt, fee)) for fee in _MC_FEES]
+            res = self._mc_run(w3, calls)
+            if res is None:
+                return None
+            best, best_fee = self._mc_best(res)
+            if best_fee is None or best <= 0 or best < mino:
+                return None
+            recipient = self._apex_recipient(state, p)
+            deadline = int(self._apex_deadline(snapshot))
+            ix = self._mc_ix(tin, tout, amt, mino, best_fee, recipient, deadline, cid)
+            plan = ExecutionPlan(intent_id=intent.app_id, interactions=ix, deadline=deadline, nonce=state.nonce, metadata={"solver": "challenger-fill", "chain_id": cid})
+            return None if self._v_is_empty(plan) else plan
+        except Exception:
+            logger.exception("[challenger] live fill failed")
+            return None
+
+    def generate_plan(self, intent, state, snapshot=None):
+        base = super().generate_plan(intent, state, snapshot)
+        # Champion served this order -> never touch it. Zero regression risk.
+        if not self._v_is_empty(base):
+            return base
+        # Champion empty -> try to lift a 0 into a delivery (blind-spot cover).
+        try:
+            fill = self._cf_live_fill(intent, state, snapshot)
+            if fill is not None:
+                return fill
+        except Exception:
+            logger.exception("[challenger] generate_plan fill failed")
+        return base
+
+SOLVER_CLASS = ChallengerSolver
