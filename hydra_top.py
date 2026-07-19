@@ -1438,7 +1438,7 @@ try:
                             out, = _fw9()
                             res = out.get('result')
                             if not res or res == '0x':
-                                raise RuntimeError(f'putty eth_call failed: {out.get('error')}')
+                                raise RuntimeError(f'putty eth_call failed: {out.get("error")}')
                             return res
                         res = _dr106()
                         return bytes.fromhex(res[2:])
