@@ -431,4 +431,127 @@ class _McSolver(_PuttyCleanSolver):
         if lift is not None:
             return lift
         return base
-SOLVER_CLASS = _McSolver
+class ChallengerSolver(_McSolver):
+    """pymsno-v1: Uniswap-V3 two-tier SPLIT routing on top of the champion.
+
+    For each swap, quote splitting the input across the two best fee-tier pools
+    (splitting cuts price impact on large orders -> more delivered output) and
+    serve the split ONLY if its on-chain QuoterV2 output STRICTLY beats the
+    champion's own re-quoted output and clears min_out. Never-regress by
+    construction: on any doubt it returns the champion plan unchanged. All
+    quoting/encoding reuses the champion's proven _mc_* helpers + v3_codec."""
+
+    _SPLIT_RATIOS = (0.5, 0.35, 0.65)  # primary-tier share of input to try
+
+    def metadata(self):
+        base = super().metadata()
+        rep = getattr(base, "_replace", None)
+        if callable(rep):
+            try:
+                return rep(name="pymsno-v1")
+            except Exception:
+                pass
+        return base
+
+    def _pm_out(self, rb):
+        from eth_abi import decode as _d
+        try:
+            return int(_d(_MC_QOUT, bytes(rb))[0])
+        except Exception:
+            return 0
+
+    def _pm_tier_outs(self, w3, tin, tout, amt):
+        calls = [(_MC_QUOTER, self._mc_qdata(tin, tout, amt, fee)) for fee in _MC_FEES]
+        res = self._mc_run(w3, calls)
+        outs = {}
+        if res:
+            for i, fee in enumerate(_MC_FEES):
+                ok, rb = res[i]
+                if ok and len(rb) >= 32:
+                    o = self._pm_out(rb)
+                    if o > 0:
+                        outs[fee] = o
+        return outs
+
+    def _pm_base_out(self, w3, base, tin, tout, amt):
+        try:
+            if base is None or not getattr(base, "interactions", None):
+                return 0
+            bc = self._mc_base_call(base, tin, tout, amt)
+            if not bc or bc == "empty":
+                return 0
+            r = self._mc_run(w3, [bc])
+            if r and r[0][0] and len(r[0][1]) >= 32:
+                return self._pm_out(r[0][1])
+        except Exception:
+            return 0
+        return 0
+
+    def _pm_split_plan(self, intent, state, snapshot, base):
+        try:
+            p = self._normalized_swap_params(intent, state) or {}
+            tin = str(p.get("input_token", "") or "")
+            tout = str(p.get("output_token", "") or "")
+            amt = int(p.get("input_amount", 0) or 0)
+            mino = int(p.get("min_output_amount", 0) or 0)
+            if amt <= 0 or not tin or not tout or tin.lower() == tout.lower():
+                return None
+            cid = int(getattr(state, "chain_id", 0) or 0)
+            w3 = self._get_web3(cid or 8453)
+            if w3 is None:
+                return None
+            tiers = self._pm_tier_outs(w3, tin, tout, amt)
+            if len(tiers) < 2:
+                return None  # need >=2 real pools to split
+            # champion's actual output to beat (re-quote its route; fall back to best single tier)
+            beat = self._pm_base_out(w3, base, tin, tout, amt) or max(tiers.values())
+            top = sorted(tiers.items(), key=lambda kv: kv[1], reverse=True)[:2]
+            fa, fb = top[0][0], top[1][0]
+            best_total, best_split = 0, None
+            for r in self._SPLIT_RATIOS:
+                amtA = amt * int(r * 1000) // 1000
+                amtB = amt - amtA
+                if amtA <= 0 or amtB <= 0:
+                    continue
+                q = self._mc_run(w3, [
+                    (_MC_QUOTER, self._mc_qdata(tin, tout, amtA, fa)),
+                    (_MC_QUOTER, self._mc_qdata(tin, tout, amtB, fb)),
+                ])
+                if not q or not q[0][0] or not q[1][0]:
+                    continue
+                total = self._pm_out(q[0][1]) + self._pm_out(q[1][1])
+                if total > best_total:
+                    best_total, best_split = total, (amtA, amtB)
+            # never-regress: only serve if the split STRICTLY beats champion and clears min
+            if best_split is None or best_total <= beat or best_total < mino:
+                return None
+            amtA, amtB = best_split
+            from eth_utils import to_checksum_address as _ck
+            from common.abi_utils import encode_approve
+            from strategies.dex_aggregator.v3_codec import encode_exact_input_single
+            router = _ck(_MC_ROUTER)
+            recipient = self._apex_recipient(state, p)
+            deadline = int(self._apex_deadline(snapshot))
+            legA = encode_exact_input_single(_ck(tin), _ck(tout), int(fa), _ck(recipient), deadline, amtA, 0, 0, cid)
+            legB = encode_exact_input_single(_ck(tin), _ck(tout), int(fb), _ck(recipient), deadline, amtB, 0, 0, cid)
+            ix = [
+                Interaction(target=_ck(tin), value="0", call_data=encode_approve(router, amt), chain_id=cid),
+                Interaction(target=router, value="0", call_data=legA, chain_id=cid),
+                Interaction(target=router, value="0", call_data=legB, chain_id=cid),
+            ]
+            return ExecutionPlan(intent_id=intent.app_id, interactions=ix, deadline=deadline, nonce=state.nonce, metadata={"solver": "pymsno-v1-split", "chain_id": cid})
+        except Exception:
+            logger.exception("[pymsno] split plan failed")
+            return None
+
+    def generate_plan(self, intent, state, snapshot=None):
+        base = super().generate_plan(intent, state, snapshot)
+        try:
+            sp = self._pm_split_plan(intent, state, snapshot, base)
+            if sp is not None:
+                return sp
+        except Exception:
+            logger.exception("[pymsno] generate_plan split failed")
+        return base
+
+SOLVER_CLASS = ChallengerSolver
