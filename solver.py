@@ -661,11 +661,72 @@ class _PymsnoEth(_McSolver):
             swap = self._ex_ix_path(route[1], route[2], amt, recip)
         return [(tin, approve), (self._EX_ROUTER, swap)]
 
-    def _ex_gate(self, state, base):
-        """(tin, tout, amt, mino, url) when this order is an eligible chain-1
-        exotic blind spot, else None."""
-        if base is not None and getattr(base, "interactions", None):
-            return None  # champion served it -> never touch
+    _EX_SEL_EIS_02 = "04e45aaf"
+    _EX_SEL_EIS = "414bf389"
+    _EX_SEL_EI_02 = "b858183f"
+    _EX_SEL_EI = "c04b8d59"
+    _EX_SEL_MC = ("ac9650d8", "5ae401dc")
+
+    def _ex_flat_calls(self, base):
+        from eth_abi import decode as _d
+        out = []
+        for i in getattr(base, "interactions", None) or []:
+            cd = str(getattr(i, "call_data", getattr(i, "calldata", "")) or "")
+            if cd.startswith("0x"):
+                cd = cd[2:]
+            if len(cd) < 8:
+                continue
+            if cd[:8] in self._EX_SEL_MC:
+                try:
+                    pl = bytes.fromhex(cd[8:])
+                    for c in _d(["bytes[]"], pl[32:] if cd[:8] == "5ae401dc" else pl)[0]:
+                        h = c.hex()
+                        if len(h) >= 8:
+                            out.append(h)
+                except Exception:
+                    out.append(cd)
+            else:
+                out.append(cd)
+        return out
+
+    def _ex_champ_out(self, base, url):
+        """The champion's OWN delivered output, so we override FAIL-CLOSED. 0 =
+        champion blind (empty); int = its re-quoted UniV3 output; None = it
+        serves via a venue we can't decode -> caller DEFERS (never a regression)."""
+        from eth_abi import decode as _d
+        if base is None or not (getattr(base, "interactions", None) or []):
+            return 0
+        for cd in self._ex_flat_calls(base):
+            sel = cd[:8]
+            body = bytes.fromhex(cd[8:]) if len(cd) > 8 else b""
+            try:
+                if sel in (self._EX_SEL_EIS_02, self._EX_SEL_EIS):
+                    if sel == self._EX_SEL_EIS_02:
+                        tin, tout, fee, _r, amt, _m, _s = _d(["(address,address,uint24,address,uint256,uint256,uint160)"], body)[0]
+                    else:
+                        tin, tout, fee, _r, _dl, amt, _m, _s = _d(["(address,address,uint24,address,uint256,uint256,uint256,uint160)"], body)[0]
+                    q = self._ex_qsingle(url, tin, tout, amt, fee)
+                    return q if q > 0 else None
+                if sel in (self._EX_SEL_EI_02, self._EX_SEL_EI):
+                    if sel == self._EX_SEL_EI_02:   # (path, recipient, amountIn, amountOutMin)
+                        path, _r, amt, _m = _d(["(bytes,address,uint256,uint256)"], body)[0]
+                    else:                            # (path, recipient, deadline, amountIn, amountOutMin)
+                        path, _r, _dl, amt, _m = _d(["(bytes,address,uint256,uint256,uint256)"], body)[0]
+                    p = path if isinstance(path, (bytes, bytearray)) else bytes.fromhex(str(path))
+                    toks, fees, o = [], [], 0
+                    while o + 20 <= len(p):
+                        toks.append("0x" + p[o:o + 20].hex()); o += 20
+                        if o + 3 <= len(p):
+                            fees.append(int.from_bytes(p[o:o + 3], "big")); o += 3
+                    q = self._ex_qpath(url, toks, fees, amt)
+                    return q if q > 0 else None
+            except Exception:
+                continue
+        return None  # non-empty but no decodable UniV3 swap -> defer
+
+    def _ex_gate(self, state):
+        """(tin, tout, amt, mino, url) when this is an eligible chain-1 exotic
+        order, else None. (Blind OR served: served ones we may still out-route.)"""
         if int(getattr(state, "chain_id", 0) or 0) != 1:
             return None
         rp = getattr(state, "raw_params", None) or {}
@@ -679,9 +740,7 @@ class _PymsnoEth(_McSolver):
             return None  # major-major: champion handles it
         u = getattr(self, "_rpc_urls", {}) or {}
         url = u.get("1") or u.get(1)
-        if not url:
-            return None
-        return tin, tout, amt, mino, url
+        return (tin, tout, amt, mino, url) if url else None
 
     def _ex_plan(self, intent, state, tin, tout, amt, route):
         recip = str(getattr(state, "contract_address", "") or
@@ -695,14 +754,24 @@ class _PymsnoEth(_McSolver):
                              metadata={"solver": "pymsno-eth", "chain_id": 1})
 
     def _py_improve(self, intent, state, snapshot, base):
+        # FAIL-CLOSED chain-1 exotic router. champ_out = the champion's own
+        # re-quoted output (0=blind, None=undecodable). We serve our best UniV3
+        # route ONLY when it BLIND-fills (champ 0) or STRICTLY beats the champion
+        # by >30bps. Defers on any doubt -> can only lift a 0 or turn a served
+        # order into a strict win, never a regression.
         try:
-            g = self._ex_gate(state, base)
+            g = self._ex_gate(state)
             if g is None:
                 return None
             tin, tout, amt, mino, url = g
+            co = self._ex_champ_out(base, url)   # 0=blind, int=served, None=undecodable
+            if co is None:
+                return None  # champion serves via a venue we can't verify -> defer
             out, route = self._ex_best(url, tin, tout, amt)
             if out <= 0 or route is None or (mino > 0 and out < mino):
                 return None
+            if co > 0 and out * 10000 <= co * 10030:
+                return None  # served: only override on a strict >30bps beat
             return self._ex_plan(intent, state, tin, tout, amt, route)
         except Exception:
             try:
