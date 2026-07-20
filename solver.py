@@ -706,7 +706,7 @@ SOLVER_CLASS = DeltaSolver
 _MINROUTER_FP = 'round-e29742671-n1-min-hk2'
 
 
-class _PymsnoFlow(_McSolver):
+class _PymsnoFlow(DeltaSolver):
     """pymsno pymsno-flow: never-regress delta on the certified champion.
     Serves its own plan only when it strictly improves on the champion's;
     defers to the champion on any doubt."""
