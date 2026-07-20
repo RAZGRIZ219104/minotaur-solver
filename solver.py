@@ -341,6 +341,15 @@ class _PymsnoNative(PolarBearRouter):
         return best, bp
 
     def _py_improve(self, intent, state, snapshot, base):
+        # NEVER-REGRESS BY CONSTRUCTION. We only act when the full champion
+        # (including its own cover) returned NO plan. On an order the champion
+        # served we cannot know its ACTUAL on-chain output at plan-time — the
+        # old code compared our quote to _py_base_out (a naive single-pool
+        # re-quote), which UNDERESTIMATES a smart champion and made us override
+        # + deliver less => regression. So we fill only blind spots the champion
+        # drops, with a rich native search (direct single across fees + 2-hop).
+        if base is not None and getattr(base, "interactions", None):
+            return None
         try:
             pp = self._py_params(intent, state)
             ctx = self._py_ctx(state)
@@ -350,12 +359,11 @@ class _PymsnoNative(PolarBearRouter):
             w3, cid = ctx
             if cid not in self._NAT_QUOTER:
                 return None
-            champ_out = self._py_base_out(w3, base, tin, tout, amt)
             d_out, d_fee = self._nat_direct(w3, cid, tin, tout, amt)
             m_out, m_path = self._nat_hop(w3, cid, tin, tout, amt)
             best = max(d_out, m_out)
-            if best <= 0 or best < mino or best <= champ_out:
-                return None  # never-regress: serve only if STRICTLY beats champion
+            if best <= 0 or best < mino:
+                return None  # no valid fill for this dropped order
             from eth_utils import to_checksum_address as _ck
             from common.abi_utils import encode_approve
             from strategies.dex_aggregator.v3_codec import encode_exact_input, encode_exact_input_single
