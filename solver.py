@@ -667,6 +667,38 @@ class _PymsnoEth(GoranSolver):
         r = self._ex_call(url, self._EX_QUOTER, data)
         return int(r[2:66], 16) if r and len(r) >= 66 else 0
 
+    _EX_V2 = ("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",   # Uniswap V2 router
+              "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F")   # SushiSwap router
+    # UniV2 getAmountsOut(uint256,address[]) / swapExactTokensForTokens(...)
+    _EX_V2_QSEL = "d06ca61f"
+    _EX_V2_SWSEL = "38ed1739"
+
+    def _ex_v2_quote(self, url, router, path, amt):
+        from eth_abi import encode as _e, decode as _d
+        data = "0x" + self._EX_V2_QSEL + _e(["uint256", "address[]"], [int(amt), path]).hex()
+        r = self._ex_call(url, router, data)
+        if not r:
+            return 0
+        try:
+            amts = _d(["uint256[]"], bytes.fromhex(r[2:]))[0]
+            return int(amts[-1]) if amts else 0
+        except Exception:
+            return 0
+
+    def _ex_best_v2(self, url, tin, tout, amt, best):
+        # chain-1 Uni-V2 / Sushi-V2 — the venue class harvey's ETH path (UniV3-only)
+        # misses. Direct + via-WETH + via-USDC constant-product routes.
+        from eth_utils import to_checksum_address as _ck
+        tc, oc = _ck(tin), _ck(tout)
+        for router in self._EX_V2:
+            for path in ([tc, oc], [tc, _ck(self._EX_WETH), oc], [tc, _ck(self._EX_USDC), oc]):
+                if len({a.lower() for a in path}) != len(path):
+                    continue
+                o = self._ex_v2_quote(url, router, path, amt)
+                if o > best[0]:
+                    best = (o, ("v2", router, path))
+        return best
+
     def _ex_best_single(self, url, tin, tout, amt, best):
         for f in self._EX_FEES:
             o = self._ex_qsingle(url, tin, tout, amt, f)
@@ -699,7 +731,8 @@ class _PymsnoEth(GoranSolver):
     def _ex_best(self, url, tin, tout, amt):
         best = self._ex_best_single(url, tin, tout, amt, (0, None))
         best = self._ex_best_2hop(url, tin, tout, amt, best)
-        return self._ex_best_3hop(url, tin, tout, amt, best)
+        best = self._ex_best_3hop(url, tin, tout, amt, best)
+        return self._ex_best_v2(url, tin, tout, amt, best)
 
     def _ex_ix_single(self, tin, tout, amt, recip, fee):
         from eth_abi import encode
@@ -716,7 +749,16 @@ class _PymsnoEth(GoranSolver):
         return self._ex_sel("exactInput((bytes,address,uint256,uint256,uint256))") +             encode(["(bytes,address,uint256,uint256,uint256)"], [(b, recip, 9999999999, amt, 1)]).hex()
 
     def _ex_ix(self, tin, tout, amt, recip, route):
+        from eth_utils import to_checksum_address as _ck
+        from eth_abi import encode as _e
         amt = int(amt)
+        if route[0] == "v2":
+            router, path = route[1], route[2]
+            approve = "0x095ea7b3" + router[2:].rjust(64, "0").lower() + amt.to_bytes(32, "big").hex()
+            swap = "0x" + self._EX_V2_SWSEL + _e(
+                ["uint256", "uint256", "address[]", "address", "uint256"],
+                [amt, 1, path, _ck(recip), 9999999999]).hex()
+            return [(tin, approve), (router, swap)]
         approve = "0x095ea7b3" + self._EX_ROUTER[2:].rjust(64, "0").lower() + amt.to_bytes(32, "big").hex()
         if route[0] == "single":
             swap = self._ex_ix_single(tin, tout, amt, recip, route[1])
@@ -792,6 +834,8 @@ class _PymsnoEth(GoranSolver):
         order, else None. (Blind OR served: served ones we may still out-route.)"""
         if int(getattr(state, "chain_id", 0) or 0) != 1:
             return None
+        if float(getattr(self, "_dyn_order_budget", None) or 99.0) < 5.0:
+            return None  # pace: tight-budget tail order -> leave it to the champion (avoid drops)
         rp = getattr(state, "raw_params", None) or {}
         tin = str(rp.get("input_token", "")).lower()
         tout = str(rp.get("output_token", "")).lower()
