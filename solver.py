@@ -507,7 +507,7 @@ except Exception:  # any import problem -> keep GoranSolver (harvey parity), nev
 
 
 
-class _PymsnoEth(GoranSolver):
+class _PymsnoEth(SOLVER_CLASS):
     """pymsno pymsno-eth: never-regress delta on the certified champion.
     Serves its own plan only when it strictly improves on the champion's;
     defers to the champion on any doubt."""
@@ -615,365 +615,63 @@ class _PymsnoEth(GoranSolver):
         return [Interaction(target=_ck(tin), value="0", call_data=encode_approve(router, amt), chain_id=cid),
                 Interaction(target=router, value="0", call_data=call, chain_id=cid)]
 
-    _EX_QUOTER = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
-    _EX_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-    _EX_WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-    _EX_USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-    _EX_MAJ = frozenset(t.lower() for t in (
-        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-        "0x6B175474E89094C44Da98b954EedeAC495271d0F",
-        "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-        "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"))
-    _EX_MIDS = ("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-                "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-                "0x6B175474E89094C44Da98b954EedeAC495271d0F",
-                "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599")
-    _EX_FEES = (100, 500, 3000, 10000)
-
-    def _ex_sel(self, sig):
-        from eth_utils import keccak
-        return "0x" + keccak(sig.encode())[:4].hex()
-
-    def _ex_call(self, url, to, data):
-        import json as _j, urllib.request as _u
-        body = _j.dumps({"jsonrpc": "2.0", "method": "eth_call",
-                         "params": [{"to": to, "data": data}, "latest"], "id": 1}).encode()
-        try:
-            r = _u.urlopen(_u.Request(url, data=body, headers={"content-type": "application/json",
-                          "User-Agent": "Mozilla/5.0"}), timeout=9)
-            res = _j.load(r).get("result")
-            return res if res and res != "0x" else None
-        except Exception:
-            return None
-
-    def _ex_qsingle(self, url, tin, tout, amt, fee):
-        from eth_abi import encode
-        data = self._ex_sel("quoteExactInputSingle((address,address,uint256,uint24,uint160))") +             encode(["(address,address,uint256,uint24,uint160)"], [(tin, tout, int(amt), fee, 0)]).hex()
-        r = self._ex_call(url, self._EX_QUOTER, data)
-        return int(r[2:66], 16) if r and len(r) >= 66 else 0
-
-    def _ex_qpath(self, url, tokens, fees, amt):
-        from eth_abi import encode
-        b = b""
-        for i, t in enumerate(tokens):
-            b += bytes.fromhex(t[2:])
-            if i < len(fees):
-                b += int(fees[i]).to_bytes(3, "big")
-        data = self._ex_sel("quoteExactInput(bytes,uint256)") + encode(["bytes", "uint256"], [b, int(amt)]).hex()
-        r = self._ex_call(url, self._EX_QUOTER, data)
-        return int(r[2:66], 16) if r and len(r) >= 66 else 0
-
-    _EX_V2 = ("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",   # Uniswap V2 router
-              "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F")   # SushiSwap router
-    # UniV2 getAmountsOut(uint256,address[]) / swapExactTokensForTokens(...)
-    _EX_V2_QSEL = "d06ca61f"
-    _EX_V2_SWSEL = "38ed1739"
-
-    def _ex_v2_quote(self, url, router, path, amt):
-        from eth_abi import encode as _e, decode as _d
-        data = "0x" + self._EX_V2_QSEL + _e(["uint256", "address[]"], [int(amt), path]).hex()
-        r = self._ex_call(url, router, data)
-        if not r:
-            return 0
-        try:
-            amts = _d(["uint256[]"], bytes.fromhex(r[2:]))[0]
-            return int(amts[-1]) if amts else 0
-        except Exception:
-            return 0
-
-    def _ex_best_v2(self, url, tin, tout, amt, best):
-        # chain-1 Uni-V2 / Sushi-V2 — the venue class harvey's ETH path (UniV3-only)
-        # misses. Direct + via-WETH + via-USDC constant-product routes.
-        from eth_utils import to_checksum_address as _ck
-        tc, oc = _ck(tin), _ck(tout)
-        for router in self._EX_V2:
-            for path in ([tc, oc], [tc, _ck(self._EX_WETH), oc], [tc, _ck(self._EX_USDC), oc]):
-                if len({a.lower() for a in path}) != len(path):
-                    continue
-                o = self._ex_v2_quote(url, router, path, amt)
-                if o > best[0]:
-                    best = (o, ("v2", router, path))
-        return best
-
-    def _ex_best_single(self, url, tin, tout, amt, best):
-        for f in self._EX_FEES:
-            o = self._ex_qsingle(url, tin, tout, amt, f)
-            if o > best[0]:
-                best = (o, ("single", f))
-        return best
-
-    def _ex_best_2hop(self, url, tin, tout, amt, best):
-        mids = [m for m in self._EX_MIDS if m.lower() not in (tin.lower(), tout.lower())]
-        for mid in mids:
-            for f1 in (500, 3000, 100):
-                for f2 in (500, 3000, 100):
-                    o = self._ex_qpath(url, [tin, mid, tout], [f1, f2], amt)
-                    if o > best[0]:
-                        best = (o, ("path", [tin, mid, tout], [f1, f2]))
-        return best
-
-    def _ex_best_3hop(self, url, tin, tout, amt, best):
-        hubs = [self._EX_WETH, self._EX_USDC]
-        for h1 in hubs:
-            for h2 in hubs:
-                if h1 == h2 or h1.lower() in (tin.lower(), tout.lower()) or h2.lower() in (tin.lower(), tout.lower()):
-                    continue
-                for f in ((500, 500, 500), (3000, 3000, 3000), (500, 3000, 500), (3000, 500, 3000)):
-                    o = self._ex_qpath(url, [tin, h1, h2, tout], list(f), amt)
-                    if o > best[0]:
-                        best = (o, ("path", [tin, h1, h2, tout], list(f)))
-        return best
-
-    def _ex_best(self, url, tin, tout, amt):
-        best = self._ex_best_single(url, tin, tout, amt, (0, None))
-        best = self._ex_best_2hop(url, tin, tout, amt, best)
-        best = self._ex_best_3hop(url, tin, tout, amt, best)
-        return self._ex_best_v2(url, tin, tout, amt, best)
-
-    def _ex_ix_single(self, tin, tout, amt, recip, fee):
-        from eth_abi import encode
-        return self._ex_sel("exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))") +             encode(["(address,address,uint24,address,uint256,uint256,uint256,uint160)"],
-                   [(tin, tout, int(fee), recip, 9999999999, amt, 1, 0)]).hex()
-
-    def _ex_ix_path(self, tokens, fees, amt, recip):
-        from eth_abi import encode
-        b = b""
-        for i, t in enumerate(tokens):
-            b += bytes.fromhex(t[2:])
-            if i < len(fees):
-                b += int(fees[i]).to_bytes(3, "big")
-        return self._ex_sel("exactInput((bytes,address,uint256,uint256,uint256))") +             encode(["(bytes,address,uint256,uint256,uint256)"], [(b, recip, 9999999999, amt, 1)]).hex()
-
-    def _ex_ix(self, tin, tout, amt, recip, route):
-        from eth_utils import to_checksum_address as _ck
-        from eth_abi import encode as _e
-        amt = int(amt)
-        if route[0] == "v2":
-            router, path = route[1], route[2]
-            approve = "0x095ea7b3" + router[2:].rjust(64, "0").lower() + amt.to_bytes(32, "big").hex()
-            swap = "0x" + self._EX_V2_SWSEL + _e(
-                ["uint256", "uint256", "address[]", "address", "uint256"],
-                [amt, 1, path, _ck(recip), 9999999999]).hex()
-            return [(tin, approve), (router, swap)]
-        approve = "0x095ea7b3" + self._EX_ROUTER[2:].rjust(64, "0").lower() + amt.to_bytes(32, "big").hex()
-        if route[0] == "single":
-            swap = self._ex_ix_single(tin, tout, amt, recip, route[1])
-        else:
-            swap = self._ex_ix_path(route[1], route[2], amt, recip)
-        return [(tin, approve), (self._EX_ROUTER, swap)]
-
-    _EX_SEL_EIS_02 = "04e45aaf"
-    _EX_SEL_EIS = "414bf389"
-    _EX_SEL_EI_02 = "b858183f"
-    _EX_SEL_EI = "c04b8d59"
-    _EX_SEL_MC = ("ac9650d8", "5ae401dc")
-
-    def _ex_flat_calls(self, base):
-        from eth_abi import decode as _d
-        out = []
-        for i in getattr(base, "interactions", None) or []:
-            cd = str(getattr(i, "call_data", getattr(i, "calldata", "")) or "")
-            if cd.startswith("0x"):
-                cd = cd[2:]
-            if len(cd) < 8:
-                continue
-            if cd[:8] in self._EX_SEL_MC:
-                try:
-                    pl = bytes.fromhex(cd[8:])
-                    for c in _d(["bytes[]"], pl[32:] if cd[:8] == "5ae401dc" else pl)[0]:
-                        h = c.hex()
-                        if len(h) >= 8:
-                            out.append(h)
-                except Exception:
-                    out.append(cd)
-            else:
-                out.append(cd)
-        return out
-
-    def _ex_champ_out(self, base, url):
-        """The champion's OWN delivered output, so we override FAIL-CLOSED. 0 =
-        champion blind (empty); int = its re-quoted UniV3 output; None = it
-        serves via a venue we can't decode -> caller DEFERS (never a regression)."""
-        from eth_abi import decode as _d
-        if base is None or not (getattr(base, "interactions", None) or []):
-            return 0
-        for cd in self._ex_flat_calls(base):
-            sel = cd[:8]
-            body = bytes.fromhex(cd[8:]) if len(cd) > 8 else b""
-            try:
-                if sel in (self._EX_SEL_EIS_02, self._EX_SEL_EIS):
-                    if sel == self._EX_SEL_EIS_02:
-                        tin, tout, fee, _r, amt, _m, _s = _d(["(address,address,uint24,address,uint256,uint256,uint160)"], body)[0]
-                    else:
-                        tin, tout, fee, _r, _dl, amt, _m, _s = _d(["(address,address,uint24,address,uint256,uint256,uint256,uint160)"], body)[0]
-                    q = self._ex_qsingle(url, tin, tout, amt, fee)
-                    return q if q > 0 else None
-                if sel in (self._EX_SEL_EI_02, self._EX_SEL_EI):
-                    if sel == self._EX_SEL_EI_02:   # (path, recipient, amountIn, amountOutMin)
-                        path, _r, amt, _m = _d(["(bytes,address,uint256,uint256)"], body)[0]
-                    else:                            # (path, recipient, deadline, amountIn, amountOutMin)
-                        path, _r, _dl, amt, _m = _d(["(bytes,address,uint256,uint256,uint256)"], body)[0]
-                    p = path if isinstance(path, (bytes, bytearray)) else bytes.fromhex(str(path))
-                    toks, fees, o = [], [], 0
-                    while o + 20 <= len(p):
-                        toks.append("0x" + p[o:o + 20].hex()); o += 20
-                        if o + 3 <= len(p):
-                            fees.append(int.from_bytes(p[o:o + 3], "big")); o += 3
-                    q = self._ex_qpath(url, toks, fees, amt)
-                    return q if q > 0 else None
-            except Exception:
-                continue
-        return None  # non-empty but no decodable UniV3 swap -> defer
-
-    def _ex_gate(self, state):
-        """(tin, tout, amt, mino, url) when this is an eligible chain-1 exotic
-        order, else None. (Blind OR served: served ones we may still out-route.)"""
-        if int(getattr(state, "chain_id", 0) or 0) != 1:
-            return None
-        if float(getattr(self, "_dyn_order_budget", None) or 99.0) < 5.0:
-            return None  # pace: tight-budget tail order -> leave it to the champion (avoid drops)
-        rp = getattr(state, "raw_params", None) or {}
-        tin = str(rp.get("input_token", "")).lower()
-        tout = str(rp.get("output_token", "")).lower()
-        amt = int(rp.get("input_amount", 0) or 0)
-        mino = int(rp.get("min_output_amount", 0) or 0)
-        if not tin or not tout or amt <= 0 or tin == tout:
-            return None
-        if tin in self._EX_MAJ and tout in self._EX_MAJ:
-            return None  # major-major: champion handles it
-        u = getattr(self, "_rpc_urls", {}) or {}
-        url = u.get("1") or u.get(1)
-        return (tin, tout, amt, mino, url) if url else None
-
-    def _ex_recip(self, state):
-        r = str(getattr(state, "contract_address", "") or
-                (getattr(state, "raw_params", None) or {}).get("receiver", "") or "").lower()
-        return r if (r.startswith("0x") and len(r) == 42) else None
-
-    def _ex_plan(self, intent, state, tin, tout, amt, route):
-        recip = self._ex_recip(state)
-        if recip is None:
-            return None
-        pairs = self._ex_ix(tin, tout, amt, recip, route)
-        ix = [Interaction(target=t, value="0", call_data=cd, chain_id=1) for (t, cd) in pairs]
-        return ExecutionPlan(intent_id=getattr(intent, "app_id", "") or "", interactions=ix,
-                             deadline=9999999999, nonce=int(getattr(state, "nonce", 0) or 0),
-                             metadata={"solver": "pymsno-eth", "chain_id": 1})
-
-    # ── eth_simulateV1 floor: measure the ACTUAL delivered output of ANY plan
-    #    (incl. undecodable KyberSwap frozen overrides) by executing it on the
-    #    fork with the input token funded via a balance-slot state override. Lets
-    #    us (a) floor against harvey's real output and (b) SIM-VERIFY our own plan
-    #    before serving it -> a wrong/reverting override can never ship. ────────
-    def _ex_ov_call(self, url, to, data, frm, ov):
-        import json as _j, urllib.request as _u
-        body = _j.dumps({"jsonrpc": "2.0", "method": "eth_call",
-                         "params": [{"from": frm, "to": to, "data": data}, "latest", ov], "id": 1}).encode()
-        try:
-            r = _u.urlopen(_u.Request(url, data=body, headers={"content-type": "application/json"}), timeout=9)
-            return _j.load(r).get("result")
-        except Exception:
-            return None
-
-    def _ex_balslot(self, url, token, holder):
-        from eth_abi import encode as _e
-        from eth_utils import keccak as _k, to_checksum_address as _ck
-        cache = self.__dict__.setdefault("_ex_slotc", {})
-        tk = token.lower()
-        if tk in cache:
-            return cache[tk]
-        h = _ck(holder); magic = 10 ** 30
-        bal = "0x70a08231" + _e(["address"], [h]).hex()
-        found = None
-        for s in range(0, 15):
-            key = "0x" + _k(_e(["address", "uint256"], [h, s])).hex()
-            ov = {_ck(token): {"stateDiff": {key: "0x" + format(magic, "064x")}}}
-            r = self._ex_ov_call(url, _ck(token), bal, h, ov)
-            if r and int(r, 16) == magic:
-                found = s
-                break
-        cache[tk] = found
-        return found
-
-    def _ex_sim_out(self, url, interactions, tin, tout, amt, recip):
-        """ACTUAL tout delivered to recip by running `interactions` on the fork
-        (tin balance funded). Returns int (>=0) or None (unmeasurable -> defer)."""
-        from eth_abi import encode as _e
-        from eth_utils import keccak as _k, to_checksum_address as _ck
-        import json as _j, urllib.request as _u
-        try:
-            ix = list(interactions or [])
-            if not ix:
-                return 0
-            slot = self._ex_balslot(url, tin, recip)
-            if slot is None:
-                return None
-            h = _ck(recip)
-            balkey = "0x" + _k(_e(["address", "uint256"], [h, slot])).hex()
-            balcall = {"from": h, "to": _ck(tout), "data": "0x70a08231" + _e(["address"], [h]).hex()}
-            calls = [balcall]
-            for i in ix:
-                cd = i.call_data if str(i.call_data).startswith("0x") else "0x" + str(i.call_data)
-                calls.append({"from": h, "to": _ck(i.target), "data": cd})
-            calls.append(balcall)
-            ov = {_ck(tin): {"stateDiff": {balkey: "0x" + format(10 ** 30, "064x")}}}
-            req = {"blockStateCalls": [{"stateOverrides": ov, "calls": calls}],
-                   "traceTransfers": False, "validation": False}
-            body = _j.dumps({"jsonrpc": "2.0", "method": "eth_simulateV1",
-                             "params": [req, "latest"], "id": 1}).encode()
-            r = _u.urlopen(_u.Request(url, data=body, headers={"content-type": "application/json"}), timeout=12)
-            d = _j.load(r)
-            if "error" in d:
-                return None
-            cs = d["result"][0]["calls"]
-            if len(cs) < 3 or any(c.get("status") != "0x1" for c in cs[1:-1]):
-                return None  # a swap/approve reverted in-sim -> unmeasurable/bad -> defer
-            def _rd(c):
-                x = c.get("returnData") or "0x"
-                return int(x[2:66], 16) if len(x) >= 66 else 0
-            return max(0, _rd(cs[-1]) - _rd(cs[0]))
-        except Exception:
-            return None
-
     def _py_improve(self, intent, state, snapshot, base):
-        # FAIL-CLOSED chain-1 exotic router. Two floors:
-        #  * decodable UniV3 champ route -> exact QuoterV2 re-quote (fast).
-        #  * undecodable champ route (KyberSwap frozen override) -> eth_simulateV1
-        #    the champion's ACTUAL output, then SIM-VERIFY our own plan too and
-        #    serve only if it really beats the champion. A wrong/stale override
-        #    (theirs OR ours) can never ship a regression.
+        # Reproduction-correct GENERAL Curve override vs sky-solver. sky serves
+        # live Curve on SERVED chain-1 orders ONLY for a ~4-pair allowlist; every
+        # other served pair where a Curve pool dominates gets its UniV3/V2 route.
+        # We quote Curve GENERALLY on the BENCH FORK at the PINNED snapshot block
+        # via the champion's OWN reproduction-correct helpers, and override when
+        # curve_dy >= 2x the best UniV3 (sky's own proven-safe gate). Curve get_dy
+        # is exact => the plan delivers exactly what we quote => WIN, never a drop.
         try:
-            g = self._ex_gate(state)
-            if g is None:
+            if int(getattr(state, "chain_id", 0) or 0) != 1:
                 return None
-            tin, tout, amt, mino, url = g
-            out, route = self._ex_best(url, tin, tout, amt)
-            if out <= 0 or route is None or (mino > 0 and out < mino):
+            base_ix = getattr(base, "interactions", None) or []
+            if not base_ix:
+                return None  # blind order -> sky's own live blind-fill already covers it
+            try:
+                from min_multivenue import _w3_block, _CURVE_WINS
+                from mv_venue import _curve_best_live, _uni_v3_best, _uni_v3_multi_best, _curve_ix
+            except Exception:
+                return None  # not the sky lineage -> nothing to add here, defer
+            rp = getattr(state, "raw_params", None) or {}
+            tin = str(rp.get("input_token", "")).lower()
+            tout = str(rp.get("output_token", "")).lower()
+            amt = int(rp.get("input_amount", 0) or 0)
+            mino = int(rp.get("min_output_amount", 0) or 0)
+            if not tin or not tout or amt <= 0 or tin == tout:
                 return None
-            co = self._ex_champ_out(base, url)   # 0=blind, int=decodable(exact), None=undecodable
-            if co is None:
-                # KyberSwap frozen override: simulate BOTH sides, apples-to-apples.
-                recip = self._ex_recip(state)
-                if recip is None:
-                    return None
-                co = self._ex_sim_out(url, getattr(base, "interactions", None) or [], tin, tout, amt, recip)
-                if co is None:
-                    return None  # can't measure champion (no sim / revert) -> defer
-                plan = self._ex_plan(intent, state, tin, tout, amt, route)
-                if plan is None:
-                    return None
-                mine = self._ex_sim_out(url, plan.interactions, tin, tout, amt, recip)
-                if mine is None or mine < mino:
-                    return None  # our plan is unmeasurable/reverts/short -> defer
-                if mine <= 0 or (co > 0 and mine * 10000 <= co * 10050):
-                    return None  # must strictly beat the simulated champion by >50bps
-                return plan
-            # decodable/empty champ: QuoterV2 & V2 getAmountsOut are exact -> quote floor.
-            if co > 0 and out * 10000 <= co * 10030:
-                return None  # served: only override on a strict >30bps beat
-            return self._ex_plan(intent, state, tin, tout, amt, route)
+            if (tin, tout) in _CURVE_WINS:
+                return None  # sky already serves Curve here -> nothing to add
+            wb = _w3_block(self, snapshot)      # champion RPC channel + PINNED block (reproduces)
+            if not wb:
+                return None
+            w3, block = wb
+            cdy, pool, i, j, sig = _curve_best_live(w3, tin, tout, amt, block)
+            if not (pool and cdy > 0):
+                return None
+            v3s = _uni_v3_best(w3, tin, tout, amt, block)           # champion single-hop UniV3
+            v3m, _p = _uni_v3_multi_best(w3, tin, tout, amt, block)  # + its 2-hop route
+            champ_exp = int((getattr(base, "metadata", None) or {}).get("expected_output", 0) or 0)
+            floor = max(v3s, v3m, champ_exp)
+            # sky's proven-safe gate, made GENERAL: Curve must dominate the champion's
+            # own UniV3 by >= 2x AND beat any stated floor. At 2x the EXACT get_dy the
+            # bench delivers strictly more than the champion => never a regression.
+            if not (v3s > 0 and cdy >= v3s * 2 and cdy > floor):
+                return None
+            if mino > 0 and cdy < mino:
+                return None
+            recip = str(getattr(state, "contract_address", "") or rp.get("receiver", "") or "").lower()
+            if not (recip.startswith("0x") and len(recip) == 42):
+                return None
+            w = {"pool": pool, "i": i, "j": j, "ex": "u256_recv" if sig == "u256" else "i128_recv"}
+            ix = _curve_ix(w, amt, tin, recip)
+            if not ix:
+                return None
+            return ExecutionPlan(intent_id=getattr(intent, "app_id", "") or "",
+                                 interactions=list(ix), deadline=9999999999,
+                                 nonce=int(getattr(state, "nonce", 0) or 0),
+                                 metadata={"solver": "pymsno-eth", "chain_id": 1, "route": "curve-general"})
         except Exception:
             try:
                 logger.exception("[pymsno-eth] failed")
