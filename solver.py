@@ -529,7 +529,7 @@ _load_mv()
 # rewrites this ONE line per submission so the name carries the SUBMITTING hotkey's
 # uid (and, as a bonus, each hotkey gets a distinct code fingerprint => its own
 # benchmark budget). Marker below is matched verbatim by the patcher; keep it stable.
-_PYMSNO_NAME = "pymsno-curvegen-raptor-205"  # __PYMSNO_NAME__
+_PYMSNO_NAME = "pymsno-eth"  # __PYMSNO_NAME__
 
 class _PymsnoEth(SOLVER_CLASS):
     """pymsno pymsno-eth: never-regress delta on the certified champion.
@@ -643,61 +643,134 @@ class _PymsnoEth(SOLVER_CLASS):
         return [Interaction(target=_ck(tin), value="0", call_data=encode_approve(router, amt), chain_id=cid),
                 Interaction(target=router, value="0", call_data=call, chain_id=cid)]
 
+    def _v2_at_block(self, w3, router, path, amt, block):
+        from eth_abi import encode as _e, decode as _d
+        from eth_utils import to_checksum_address as _ck
+        try:
+            data = "0xd06ca61f" + _e(["uint256", "address[]"], [int(amt), [_ck(p) for p in path]]).hex()
+            r = w3.eth.call({"to": _ck(router), "data": data}, block_identifier=block)
+            amts = _d(["uint256[]"], bytes(r))[0]
+            return int(amts[-1]) if amts else 0
+        except Exception:
+            return 0
+
+    def _v2_best(self, w3, tin, tout, amt, block):
+        WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        best = 0
+        for r in ("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+                  "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"):
+            for path in ([tin, tout], [tin, WETH, tout], [tin, USDC, tout]):
+                if len({a.lower() for a in path}) != len(path):
+                    continue
+                o = self._v2_at_block(w3, r, path, amt, block)
+                if o > best:
+                    best = o
+        return best
+
+    def _sim_out(self, rpc, block, plan_ix, tin, tout, recip):
+        """ACTUAL tout delivered by executing plan_ix on the fork at `block` (tin
+        funded via balance-slot override). VERIFIES a Curve exchange really
+        delivers before we override => immune to garbage get_dy quotes. Returns
+        int, or None (no sim support / revert => caller DEFERS, never a regression)."""
+        import json as _j, urllib.request as _u
+        from eth_abi import encode as _e
+        from eth_utils import keccak as _k, to_checksum_address as _ck
+        try:
+            h = _ck(recip); magic = 10 ** 30
+            blk = hex(int(block)) if isinstance(block, int) else "latest"
+            bal = "0x70a08231" + _e(["address"], [h]).hex()
+            def call(method, params):
+                body = _j.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+                r = _u.urlopen(_u.Request(rpc, data=body, headers={"content-type": "application/json"}), timeout=12)
+                return _j.load(r)
+            cache = self.__dict__.setdefault("_pm_slotc", {})
+            slot = cache.get(tin.lower())
+            if slot is None:
+                for s in range(0, 15):
+                    key = "0x" + _k(_e(["address", "uint256"], [h, s])).hex()
+                    ov = {_ck(tin): {"stateDiff": {key: "0x" + format(magic, "064x")}}}
+                    r = call("eth_call", [{"to": _ck(tin), "data": bal}, blk, ov])
+                    if r.get("result") and int(r["result"], 16) == magic:
+                        slot = s; break
+                if slot is None:
+                    return None
+                cache[tin.lower()] = slot
+            balkey = "0x" + _k(_e(["address", "uint256"], [h, slot])).hex()
+            balcall = {"from": h, "to": _ck(tout), "data": bal}
+            calls = [balcall]
+            for i in plan_ix:
+                cd = i.call_data if str(i.call_data).startswith("0x") else "0x" + str(i.call_data)
+                calls.append({"from": h, "to": _ck(i.target), "data": cd})
+            calls.append(balcall)
+            ov = {_ck(tin): {"stateDiff": {balkey: "0x" + format(magic, "064x")}}}
+            req = {"blockStateCalls": [{"stateOverrides": ov, "calls": calls}], "validation": False}
+            r = call("eth_simulateV1", [req, blk])
+            if "error" in r:
+                return None
+            cs = r["result"][0]["calls"]
+            if len(cs) < 3 or any(c.get("status") != "0x1" for c in cs[1:-1]):
+                return None
+            def rd(c):
+                x = c.get("returnData") or "0x"
+                return int(x[2:66], 16) if len(x) >= 66 else 0
+            return max(0, rd(cs[-1]) - rd(cs[0]))
+        except Exception:
+            return None
+
     def _py_improve(self, intent, state, snapshot, base):
-        # Reproduction-correct GENERAL Curve override vs sky-solver. sky serves
-        # live Curve on SERVED chain-1 orders ONLY for a ~4-pair allowlist; every
-        # other served pair where a Curve pool dominates gets its UniV3/V2 route.
-        # We quote Curve GENERALLY on the BENCH FORK at the PINNED snapshot block
-        # via the champion's OWN reproduction-correct helpers, and override when
-        # curve_dy >= 2x the best UniV3 (sky's own proven-safe gate). Curve get_dy
-        # is exact => the plan delivers exactly what we quote => WIN, never a drop.
+        # SIM-VERIFIED general Curve override vs the sky/ninja lineage. The champion
+        # serves live Curve on SERVED chain-1 orders ONLY for its ~4-pair allowlist.
+        # We find a Curve win GENERALLY on the bench fork at the PINNED block, floor
+        # against the champion's ACTUAL best route (UniV3 single+2hop + V2, exact),
+        # then EXECUTE our Curve plan in eth_simulateV1 to CONFIRM it truly delivers
+        # more (immune to garbage get_dy). Override only on a verified > champion
+        # delivery; defer on ANY doubt (no sim / revert / not better) => never a drop.
         try:
             if int(getattr(state, "chain_id", 0) or 0) != 1:
                 return None
-            base_ix = getattr(base, "interactions", None) or []
-            if not base_ix:
-                return None  # blind order -> sky's own live blind-fill already covers it
+            if not (getattr(base, "interactions", None) or []):
+                return None  # blind -> champion's own live blind-fill covers it
             try:
                 from min_multivenue import _w3_block, _CURVE_WINS
                 from mv_venue import _curve_best_live, _uni_v3_best, _uni_v3_multi_best, _curve_ix
             except Exception:
-                return None  # not the sky lineage -> nothing to add here, defer
+                return None
             rp = getattr(state, "raw_params", None) or {}
             tin = str(rp.get("input_token", "")).lower()
             tout = str(rp.get("output_token", "")).lower()
             amt = int(rp.get("input_amount", 0) or 0)
             mino = int(rp.get("min_output_amount", 0) or 0)
-            if not tin or not tout or amt <= 0 or tin == tout:
+            if not tin or not tout or amt <= 0 or tin == tout or (tin, tout) in _CURVE_WINS:
                 return None
-            if (tin, tout) in _CURVE_WINS:
-                return None  # sky already serves Curve here -> nothing to add
-            wb = _w3_block(self, snapshot)      # champion RPC channel + PINNED block (reproduces)
+            wb = _w3_block(self, snapshot)
             if not wb:
                 return None
             w3, block = wb
             cdy, pool, i, j, sig = _curve_best_live(w3, tin, tout, amt, block)
             if not (pool and cdy > 0):
                 return None
-            v3s = _uni_v3_best(w3, tin, tout, amt, block)           # champion single-hop UniV3
-            v3m, _p = _uni_v3_multi_best(w3, tin, tout, amt, block)  # + its 2-hop route
-            champ_exp = int((getattr(base, "metadata", None) or {}).get("expected_output", 0) or 0)
-            floor = max(v3s, v3m, champ_exp)
-            # sky's proven-safe gate, made GENERAL: Curve must dominate the champion's
-            # own UniV3 by >= 2x AND beat any stated floor. At 2x the EXACT get_dy the
-            # bench delivers strictly more than the champion => never a regression.
-            if not (v3s > 0 and cdy >= v3s * 2 and cdy > floor):
-                return None
-            if mino > 0 and cdy < mino:
-                return None
+            floor = max(_uni_v3_best(w3, tin, tout, amt, block) or 0,
+                        (_uni_v3_multi_best(w3, tin, tout, amt, block) or (0, None))[0] or 0,
+                        self._v2_best(w3, tin, tout, amt, block) or 0,
+                        int((getattr(base, "metadata", None) or {}).get("expected_output", 0) or 0))
+            if floor <= 0 or cdy <= floor:
+                return None  # quoted Curve not ahead of the champion's route -> defer
             recip = str(getattr(state, "contract_address", "") or rp.get("receiver", "") or "").lower()
             if not (recip.startswith("0x") and len(recip) == 42):
                 return None
             w = {"pool": pool, "i": i, "j": j, "ex": "u256_recv" if sig == "u256" else "i128_recv"}
-            ix = _curve_ix(w, amt, tin, recip)
+            ix = list(_curve_ix(w, amt, tin, recip) or [])
             if not ix:
                 return None
+            rpc = (getattr(self, "_rpc_urls", {}) or {}).get("1") or (getattr(self, "_rpc_urls", {}) or {}).get(1)
+            if not rpc:
+                return None
+            real = self._sim_out(rpc, block, ix, tin, tout, recip)   # EXECUTE + measure
+            if real is None or real < mino or real <= floor * 1005 // 1000:
+                return None  # unverifiable / reverts / not > champion by 0.5% -> defer
             return ExecutionPlan(intent_id=getattr(intent, "app_id", "") or "",
-                                 interactions=list(ix), deadline=9999999999,
+                                 interactions=ix, deadline=9999999999,
                                  nonce=int(getattr(state, "nonce", 0) or 0),
                                  metadata={"solver": "pymsno-eth", "chain_id": 1, "route": "curve-general"})
         except Exception:
