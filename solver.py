@@ -849,10 +849,14 @@ class _PymsnoEth(GoranSolver):
         url = u.get("1") or u.get(1)
         return (tin, tout, amt, mino, url) if url else None
 
+    def _ex_recip(self, state):
+        r = str(getattr(state, "contract_address", "") or
+                (getattr(state, "raw_params", None) or {}).get("receiver", "") or "").lower()
+        return r if (r.startswith("0x") and len(r) == 42) else None
+
     def _ex_plan(self, intent, state, tin, tout, amt, route):
-        recip = str(getattr(state, "contract_address", "") or
-                    (getattr(state, "raw_params", None) or {}).get("receiver", "") or "").lower()
-        if not (recip.startswith("0x") and len(recip) == 42):
+        recip = self._ex_recip(state)
+        if recip is None:
             return None
         pairs = self._ex_ix(tin, tout, amt, recip, route)
         ix = [Interaction(target=t, value="0", call_data=cd, chain_id=1) for (t, cd) in pairs]
@@ -860,23 +864,115 @@ class _PymsnoEth(GoranSolver):
                              deadline=9999999999, nonce=int(getattr(state, "nonce", 0) or 0),
                              metadata={"solver": "pymsno-eth", "chain_id": 1})
 
+    # ── eth_simulateV1 floor: measure the ACTUAL delivered output of ANY plan
+    #    (incl. undecodable KyberSwap frozen overrides) by executing it on the
+    #    fork with the input token funded via a balance-slot state override. Lets
+    #    us (a) floor against harvey's real output and (b) SIM-VERIFY our own plan
+    #    before serving it -> a wrong/reverting override can never ship. ────────
+    def _ex_ov_call(self, url, to, data, frm, ov):
+        import json as _j, urllib.request as _u
+        body = _j.dumps({"jsonrpc": "2.0", "method": "eth_call",
+                         "params": [{"from": frm, "to": to, "data": data}, "latest", ov], "id": 1}).encode()
+        try:
+            r = _u.urlopen(_u.Request(url, data=body, headers={"content-type": "application/json"}), timeout=9)
+            return _j.load(r).get("result")
+        except Exception:
+            return None
+
+    def _ex_balslot(self, url, token, holder):
+        from eth_abi import encode as _e
+        from eth_utils import keccak as _k, to_checksum_address as _ck
+        cache = self.__dict__.setdefault("_ex_slotc", {})
+        tk = token.lower()
+        if tk in cache:
+            return cache[tk]
+        h = _ck(holder); magic = 10 ** 30
+        bal = "0x70a08231" + _e(["address"], [h]).hex()
+        found = None
+        for s in range(0, 15):
+            key = "0x" + _k(_e(["address", "uint256"], [h, s])).hex()
+            ov = {_ck(token): {"stateDiff": {key: "0x" + format(magic, "064x")}}}
+            r = self._ex_ov_call(url, _ck(token), bal, h, ov)
+            if r and int(r, 16) == magic:
+                found = s
+                break
+        cache[tk] = found
+        return found
+
+    def _ex_sim_out(self, url, interactions, tin, tout, amt, recip):
+        """ACTUAL tout delivered to recip by running `interactions` on the fork
+        (tin balance funded). Returns int (>=0) or None (unmeasurable -> defer)."""
+        from eth_abi import encode as _e
+        from eth_utils import keccak as _k, to_checksum_address as _ck
+        import json as _j, urllib.request as _u
+        try:
+            ix = list(interactions or [])
+            if not ix:
+                return 0
+            slot = self._ex_balslot(url, tin, recip)
+            if slot is None:
+                return None
+            h = _ck(recip)
+            balkey = "0x" + _k(_e(["address", "uint256"], [h, slot])).hex()
+            balcall = {"from": h, "to": _ck(tout), "data": "0x70a08231" + _e(["address"], [h]).hex()}
+            calls = [balcall]
+            for i in ix:
+                cd = i.call_data if str(i.call_data).startswith("0x") else "0x" + str(i.call_data)
+                calls.append({"from": h, "to": _ck(i.target), "data": cd})
+            calls.append(balcall)
+            ov = {_ck(tin): {"stateDiff": {balkey: "0x" + format(10 ** 30, "064x")}}}
+            req = {"blockStateCalls": [{"stateOverrides": ov, "calls": calls}],
+                   "traceTransfers": False, "validation": False}
+            body = _j.dumps({"jsonrpc": "2.0", "method": "eth_simulateV1",
+                             "params": [req, "latest"], "id": 1}).encode()
+            r = _u.urlopen(_u.Request(url, data=body, headers={"content-type": "application/json"}), timeout=12)
+            d = _j.load(r)
+            if "error" in d:
+                return None
+            cs = d["result"][0]["calls"]
+            if len(cs) < 3 or any(c.get("status") != "0x1" for c in cs[1:-1]):
+                return None  # a swap/approve reverted in-sim -> unmeasurable/bad -> defer
+            def _rd(c):
+                x = c.get("returnData") or "0x"
+                return int(x[2:66], 16) if len(x) >= 66 else 0
+            return max(0, _rd(cs[-1]) - _rd(cs[0]))
+        except Exception:
+            return None
+
     def _py_improve(self, intent, state, snapshot, base):
-        # FAIL-CLOSED chain-1 exotic router. champ_out = the champion's own
-        # re-quoted output (0=blind, None=undecodable). We serve our best UniV3
-        # route ONLY when it BLIND-fills (champ 0) or STRICTLY beats the champion
-        # by >30bps. Defers on any doubt -> can only lift a 0 or turn a served
-        # order into a strict win, never a regression.
+        # FAIL-CLOSED chain-1 exotic router. Two floors:
+        #  * decodable UniV3 champ route -> exact QuoterV2 re-quote (fast).
+        #  * undecodable champ route (KyberSwap frozen override) -> eth_simulateV1
+        #    the champion's ACTUAL output, then SIM-VERIFY our own plan too and
+        #    serve only if it really beats the champion. A wrong/stale override
+        #    (theirs OR ours) can never ship a regression.
         try:
             g = self._ex_gate(state)
             if g is None:
                 return None
             tin, tout, amt, mino, url = g
-            co = self._ex_champ_out(base, url)   # 0=blind, int=served, None=undecodable
-            if co is None:
-                return None  # champion serves via a venue we can't verify -> defer
             out, route = self._ex_best(url, tin, tout, amt)
             if out <= 0 or route is None or (mino > 0 and out < mino):
                 return None
+            co = self._ex_champ_out(base, url)   # 0=blind, int=decodable(exact), None=undecodable
+            if co is None:
+                # KyberSwap frozen override: simulate BOTH sides, apples-to-apples.
+                recip = self._ex_recip(state)
+                if recip is None:
+                    return None
+                co = self._ex_sim_out(url, getattr(base, "interactions", None) or [], tin, tout, amt, recip)
+                if co is None:
+                    return None  # can't measure champion (no sim / revert) -> defer
+                plan = self._ex_plan(intent, state, tin, tout, amt, route)
+                if plan is None:
+                    return None
+                mine = self._ex_sim_out(url, plan.interactions, tin, tout, amt, recip)
+                if mine is None or mine < mino:
+                    return None  # our plan is unmeasurable/reverts/short -> defer
+                if mine <= 0 or (co > 0 and mine * 10000 <= co * 10050):
+                    return None  # must strictly beat the simulated champion by >50bps
+                return plan
+            # decodable/empty champ: QuoterV2 & V2 getAmountsOut are exact -> quote floor.
             if co > 0 and out * 10000 <= co * 10030:
                 return None  # served: only override on a strict >30bps beat
             return self._ex_plan(intent, state, tin, tout, amt, route)
