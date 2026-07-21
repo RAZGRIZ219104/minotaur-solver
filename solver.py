@@ -507,6 +507,12 @@ except Exception:  # any import problem -> keep GoranSolver (harvey parity), nev
 
 
 
+# Submission name — pymsno-<algorithm>-<fighter jet>-<miner uid>. The orchestrator
+# rewrites this ONE line per submission so the name carries the SUBMITTING hotkey's
+# uid (and, as a bonus, each hotkey gets a distinct code fingerprint => its own
+# benchmark budget). Marker below is matched verbatim by the patcher; keep it stable.
+_PYMSNO_NAME = "pymsno-eth"  # __PYMSNO_NAME__
+
 class _PymsnoEth(SOLVER_CLASS):
     """pymsno pymsno-eth: never-regress delta on the certified champion.
     Serves its own plan only when it strictly improves on the champion's;
@@ -517,15 +523,19 @@ class _PymsnoEth(SOLVER_CLASS):
         try:
             import dataclasses as _dc
             if _dc.is_dataclass(base):
-                return _dc.replace(base, name="pymsno-eth")
+                return _dc.replace(base, name=_PYMSNO_NAME)
         except Exception:
             pass
         rep = getattr(base, "_replace", None)
         if callable(rep):
             try:
-                return rep(name="pymsno-eth")
+                return rep(name=_PYMSNO_NAME)
             except Exception:
                 pass
+        try:
+            base.name = _PYMSNO_NAME
+        except Exception:
+            pass
         return base
 
     def _py_params(self, intent, state):
