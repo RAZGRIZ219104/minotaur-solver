@@ -511,7 +511,7 @@ except Exception:  # any import problem -> keep GoranSolver (harvey parity), nev
 # rewrites this ONE line per submission so the name carries the SUBMITTING hotkey's
 # uid (and, as a bonus, each hotkey gets a distinct code fingerprint => its own
 # benchmark budget). Marker below is matched verbatim by the patcher; keep it stable.
-_PYMSNO_NAME = "pymsno-eth"  # __PYMSNO_NAME__
+_PYMSNO_NAME = "pymsno-curvegen-raptor-205"  # __PYMSNO_NAME__
 
 class _PymsnoEth(SOLVER_CLASS):
     """pymsno pymsno-eth: never-regress delta on the certified champion.
