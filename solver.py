@@ -533,7 +533,7 @@ _load_mv()
 # SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT (2 benched rounds per identical code). Both
 # markers below are matched verbatim by the patcher; keep them stable.
 _PYMSNO_NAME = "pymsno-curvegen-raptor-34"  # __PYMSNO_NAME__
-_PYMSNO_FP = "e29744551-n1-34-razgriz"  # __PYMSNO_FP__  (rotated per submission -> unique fingerprint each round)
+_PYMSNO_FP = "e29744631-n1-34-razgriz"  # __PYMSNO_FP__  (rotated per submission -> unique fingerprint each round)
 
 class _PymsnoEth(SOLVER_CLASS):
     """pymsno pymsno-eth: never-regress delta on the certified champion.
