@@ -635,8 +635,8 @@ _MINROUTER_FP = 'round-e29744770-n1-min-hk6'
 # Rotating it every round makes every submission a distinct fingerprint, so we never trip
 # SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT (2 benched rounds per identical code). Both
 # markers below are matched verbatim by the patcher; keep them stable.
-_PYMSNO_NAME = "pymsno-eth"  # __PYMSNO_NAME__
-_PYMSNO_FP = "fp0"  # __PYMSNO_FP__  (rotated per submission -> unique fingerprint each round)
+_PYMSNO_NAME = "pymsno-mvcover-raptor-215"  # __PYMSNO_NAME__
+_PYMSNO_FP = "e29744911-n1-215-razgriz"  # __PYMSNO_FP__  (rotated per submission -> unique fingerprint each round)
 
 class _PymsnoEth(SOLVER_CLASS):
     """pymsno pymsno-eth: never-regress delta on the certified champion.
