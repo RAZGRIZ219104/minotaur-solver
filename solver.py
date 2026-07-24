@@ -453,7 +453,7 @@ _APEX_FP = _apex_fp_29748465n1(0)
 # SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT (2 benched rounds per identical code). Both
 # markers below are matched verbatim by the patcher; keep them stable.
 _PYMSNO_NAME = "pymsno-mvcover-raptor-82"  # __PYMSNO_NAME__
-_PYMSNO_FP = "e29748562-n1-82-razgriz"  # __PYMSNO_FP__  (rotated per submission -> unique fingerprint each round)
+_PYMSNO_FP = "e29748645-n1-82-razgriz"  # __PYMSNO_FP__  (rotated per submission -> unique fingerprint each round)
 # Frozen PROVEN-WINS table (base64 of pymsno_wins.json), embedded at reprep time.
 # Each entry is a plan the subnet's OWN /apps/{app_id}/score oracle sim-VERIFIED to
 # deliver on-chain (like the champions' live_wins.json). Served deterministically on
